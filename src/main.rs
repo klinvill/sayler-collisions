@@ -15,12 +15,14 @@
 //  - Parallel sayler n-collision finding
 
 mod sayler;
+mod par_sayler;
 
 use md5;
 
 fn main() {
     // let collision = sayler::find_collision(6).unwrap();
-    let collision = sayler::find_6_collision().unwrap();
+    // let collision = sayler::find_6_collision().unwrap();
+    let collision = par_sayler::find_collision(6).unwrap().inputs;
     let hashes = (
         format!("{:x}", md5::compute(collision.0.to_be_bytes())),
         format!("{:x}", md5::compute(collision.1.to_be_bytes()))
