@@ -4,6 +4,10 @@ use rayon::prelude::*;
 use std::sync::mpsc;
 use std::thread;
 use std::time;
+use std::convert::TryInto;
+use std::cmp::min;
+use md5::Digest;
+use std::borrow::Borrow;
 
 pub struct SaylerResult {
     pub inputs: (u128, u128),
@@ -32,22 +36,73 @@ pub fn find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     return parallel_find_collision(n);
 }
 
+/// Returns the 0-indexed partition number a value belongs in
+///
+/// # Arguments
+/// [`stride`]: stride between partitions
+/// [`partitions`]: number of partitions
+fn partition(value: u128, stride: u128, partitions: usize) -> usize {
+    return min((value / stride) as usize, partitions-1);
+}
+
+/// Computes the Sayler value from an md5 hash
+///
+/// A Sayler value is defined here as a 128-bit unsigned integer derived from the first n and last n
+/// hex values from an md5 hash. Sayler values have a 1-to-1 mapping with u128 values.
+fn extract_sayler_value(hash: Digest, n: usize) -> u128 {
+    // TODO: handle non-even n which would require tracking arrays of 4 bits rather than the arrays
+    //  of bytes that the MD5 digest produces
+    let n_bytes = n / 2;
+
+    // Note: ideally we should be able to use static arrays, however support for generic
+    //  constants is needed to do this (implementation in progress at
+    //  https://github.com/rust-lang/rust/issues/44580)
+    let mut entry: Vec<u8> = Vec::with_capacity(n);
+    // Since we're looking for Sayler collisions, we only care about the first and last n/2 bytes
+    entry.extend_from_slice(&hash[0..n_bytes]);
+    entry.extend_from_slice(&hash[16 - n_bytes..]);
+
+    // pad with zeros so we can create a u128 value
+    for _ in entry.len()..16 {
+        entry.push(0);
+    }
+
+    // Note: since we're looking for a hash collision, it doesn't really matter that the hash
+    // value matches the derived u128 value (hence the use of little endianness for convenience)
+    // as long as there's a 1-to-1 mapping between hash values and u128 values.
+    let int_val = u128::from_le_bytes(entry.as_slice().try_into().unwrap());
+    return int_val;
+}
+
 fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
-    // rayon::ThreadPoolBuilder::new().num_threads(1).build_global().unwrap();
+    const WORKER_TO_READER_RATIO: usize = 2;
+    // TODO: pull dynamically or allow user to specify
+    const CORES: usize = 16;
+    const BUFFER_SIZE: usize = 128;
 
-    let n_bytes: usize = (n / 2) as usize;
-    let tail_index: usize = (128 / 8) - n_bytes;
+    let reader_threads = CORES / (WORKER_TO_READER_RATIO + 1);
+    let worker_threads = reader_threads * WORKER_TO_READER_RATIO;
 
-    let (worker_tx, worker_rx) = mpsc::sync_channel(25);
-    let (checker_tx, checker_rx) = mpsc::channel();
+    let lower_sayler_bound: u128 = 0;
+    let mut upper_sayler_bound_bytes:Vec<u8> = Vec::new();
+    for _ in 0..n {
+        upper_sayler_bound_bytes.push(u8::max_value());
+    }
+    for _ in n..16 {
+        upper_sayler_bound_bytes.push(u8::min_value());
+    }
+    let upper_sayler_bound = u128::from_le_bytes(upper_sayler_bound_bytes.as_slice().try_into().unwrap());
 
-    // Rayon's par_iter blocks so we need to spawn the tracker in another thread before running the workers
-    thread::spawn(move || hash_tracker(worker_rx, checker_tx, n as usize));
+    let stride = (upper_sayler_bound - lower_sayler_bound) / (reader_threads as u128);
 
-    (0..std::u128::MAX).into_par_iter()
-        .for_each_with(WorkerInit {tx: worker_tx, n: n as usize, n_bytes, tail_index}, hash_worker);
+    let (result_tx, result_rx) = mpsc::channel();
 
-    let result = checker_rx.recv();
+    // Rayon's par_iter blocks so we need to spawn readers and workers in separate threads
+    let (reader_txs, reader_rxs) = (0..reader_threads).map(|_| mpsc::sync_channel(BUFFER_SIZE)).unzip();
+    thread::spawn(move || spawn_readers(reader_threads.clone(), result_tx, reader_rxs, n.clone() as usize));
+    thread::spawn(move || spawn_workers(worker_threads, reader_txs, stride, reader_threads, n as usize));
+
+    let result = result_rx.recv();
 
     return match result {
         Ok(result) => result,
@@ -56,32 +111,59 @@ fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     }
 }
 
+fn spawn_readers(
+    threads: usize,
+    result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>,
+    reader_rxs: Vec<mpsc::Receiver<WorkerResult>>,
+    n: usize
+) {
+    let reader_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    reader_pool.build().unwrap().install(|| {
+        (reader_rxs).into_par_iter()
+            .for_each_with(ReaderInit {result_tx, n}, reader_thread);
+    })
+}
+
+fn reader_thread(init: &mut ReaderInit, rx: mpsc::Receiver<WorkerResult>) {
+    let cloned_tx = mpsc::Sender::clone(&init.result_tx);
+    hash_tracker(rx, cloned_tx, init.n);
+}
+
+#[derive(Clone)]
+struct ReaderInit {
+    result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>,
+    n: usize,
+}
+
 struct WorkerResult {
-    result: Vec<u8>,
+    result: u128,
     input: u128,
 }
 
 #[derive(Clone)]
 struct WorkerInit {
-    tx: mpsc::SyncSender<WorkerResult>,
+    reader_txs: Vec<mpsc::SyncSender<WorkerResult>>,
+    stride: u128,
+    partitions: usize,
     n: usize,
-    n_bytes: usize,
-    tail_index: usize,
+}
+
+fn spawn_workers(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize, n: usize) {
+    let worker_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    worker_pool.build().unwrap().install(|| {
+        (0..std::u128::MAX).into_par_iter()
+            .for_each_with(WorkerInit {reader_txs, stride, partitions, n}, hash_worker);
+    });
 }
 
 fn hash_worker(init: &mut WorkerInit, input: u128) {
     let digest = md5::compute(input.to_be_bytes());
+    let sayler_value = extract_sayler_value(digest, init.n);
 
-    // Note: ideally we should be able to use static arrays, however support for generic
-    //  constants is needed to do this (implementation in progress at
-    //  https://github.com/rust-lang/rust/issues/44580)
-    let mut entry: Vec<u8> = Vec::with_capacity(init.n);
-    // Since we're looking for Sayler collisions, we only care about the first and last n/2 bytes
-    entry.extend_from_slice(&digest[0..init.n_bytes]);
-    entry.extend_from_slice(&digest[init.tail_index..]);
-
-    match init.tx.send(WorkerResult { input, result: entry }) {
-        Err(e) => eprintln!("Worker error while sending result: {}", e),
+    let reader = partition(sayler_value, init.stride, init.partitions);
+    let tx = init.reader_txs[reader].borrow();
+    match tx.send(WorkerResult { input, result: sayler_value }) {
+        Err(e) => eprintln!("Worker error while sending result to reader {}: {}", reader, e),
         Ok(_) => (),
     }
 }
@@ -93,7 +175,7 @@ fn hash_tracker(worker_rx: mpsc::Receiver<WorkerResult>, result_tx: mpsc::Sender
     let expected_collision_at: usize = 2 ^ (4 * n);
 
     // We pre-allocate a hashmap with ~.5x extra headroom to avoid needing to resize the heap
-    let mut hashes: HashMap<Vec<u8>, u128> = HashMap::with_capacity(expected_collision_at * 3 / 2);
+    let mut hashes: HashMap<u128, u128> = HashMap::with_capacity(expected_collision_at * 3 / 2);
     let mut collision: Option<SaylerResult> = None;
 
     let start = time::Instant::now();
@@ -125,12 +207,74 @@ fn hash_tracker(worker_rx: mpsc::Receiver<WorkerResult>, result_tx: mpsc::Sender
     ).unwrap();
 }
 
-fn check_hash(item: WorkerResult, hashes: &mut HashMap<Vec<u8>, u128>) -> Option<SaylerResult> {
-    if hashes.contains_key(item.result.as_slice()) {
-        let previous_input = *hashes.get(item.result.as_slice()).unwrap();
+fn check_hash(item: WorkerResult, hashes: &mut HashMap<u128, u128>) -> Option<SaylerResult> {
+    if hashes.contains_key(&item.result) {
+        let previous_input = *hashes.get(&item.result).unwrap();
         return Some(SaylerResult {inputs: (previous_input, item.input)});
     }
 
     hashes.insert(item.result, item.input);
     return None;
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod test_partition {
+        use super::*;
+
+        #[test]
+        fn test_partition() {
+            let values = 0..6;
+            let expected_partitions = (0..2).flat_map(|i: usize| vec![i, i].into_iter());
+            let stride = 2;
+            let partitions = 3;
+
+            values.zip(expected_partitions).for_each(|(value, expected_partition)| {
+                let actual = partition(value, stride, partitions);
+                assert_eq!(actual, expected_partition,
+                           "Mismatch between actual and expected partitions for input value {}", value);
+            });
+        }
+
+        #[test]
+        fn test_extra_values_fall_into_last_partition() {
+            // Given 3 partitions and a range of values from 0 to 6 inclusive, the partitions are
+            // expected to look like: | 0, 1 | 2, 3 | 4, 5, 6 |
+            let value = 6;
+            let expected_partition = 2;
+            let stride = 2;
+            let partitions = 3;
+
+
+            let actual = partition(value, stride, partitions);
+            assert_eq!(actual, expected_partition);
+        }
+    }
+
+    mod test_extract_sayler_value {
+        use super::*;
+
+        #[test]
+        fn test_extract_sayler_value() {
+            let a = md5::Digest([0, 1, 2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15]);
+            let b = md5::Digest([0, 1, 2, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 13, 14, 15]);
+            let c = md5::Digest([99; 16]);
+            let d = md5::Digest([1, 0, 2, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 13, 14, 15]);
+
+            // use the first 3 bytes (6 hex values) and last 3 bytes (6 hex values)
+            let n = 6;
+
+            let sayler_a = extract_sayler_value(a, n);
+            let sayler_b = extract_sayler_value(b, n);
+            let sayler_c = extract_sayler_value(c, n);
+            let sayler_d = extract_sayler_value(d, n);
+
+            assert_eq!(sayler_a, sayler_b);
+            assert_ne!(sayler_a, sayler_c);
+            assert_ne!(sayler_a, sayler_d);
+        }
+    }
 }
