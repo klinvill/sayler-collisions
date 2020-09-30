@@ -9,9 +9,10 @@ use std::cmp::min;
 use md5::Digest;
 use std::borrow::Borrow;
 
-pub struct SaylerResult {
-    pub inputs: (u128, u128),
-}
+use super::sayler::SaylerResult;
+
+// TODO: Memory efficient implementation found here on page 3: https://eprint.iacr.org/2012/731.pdf
+// TODO: Could parallelize using OpenCL and the kernel found here: https://github.com/sghctoma/oclcrack/blob/master/MD5.cl
 
 /// Parallel Sayler n-Collision finding for MD5
 ///

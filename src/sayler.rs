@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use md5;
 use std::time;
 
+pub struct SaylerResult {
+    pub inputs: (u128, u128),
+}
+
 /// Finds a Sayler n-Collision for MD5
 ///
 /// A Sayler n-Collision is a pair of distinct inputs whose md5sum matches in the first n and last
@@ -11,7 +15,7 @@ use std::time;
 /// d41d8ce1987fbb152380234511f8427e  file1
 /// $ md5sum file2
 /// d41d8cd98f00b204e9800998ecf8427e  file2
-pub fn find_collision(n: u8) -> Result<(u128, u128), &'static str> {
+pub fn find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     if n > 16 {
         return Err("There are only 32 hex digits in an MD5 hash, therefore there are no collisions for n > 16");
     }
@@ -29,7 +33,7 @@ pub fn find_collision(n: u8) -> Result<(u128, u128), &'static str> {
 ///
 /// Expected to need ~2^(4*n) entries since a collision is expected after ~2^(4*n) inputs as per
 /// the birthday paradox.
-fn single_pass_find_collision(n: u8) -> Result<(u128, u128), &'static str> {
+fn single_pass_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     const TIMED_ITERATIONS: u32 = 1000000;
 
     let n_bytes: usize = (n / 2) as usize;
@@ -64,7 +68,7 @@ fn single_pass_find_collision(n: u8) -> Result<(u128, u128), &'static str> {
             eprintln!("Completed running {} iterations in {} seconds",
                       input,
                       start.elapsed().as_secs_f32());
-            return Ok((*hashes.get(entry.as_slice()).unwrap(), input));
+            return Ok(SaylerResult {inputs: (*hashes.get(entry.as_slice()).unwrap(), input)});
         }
         hashes.insert(entry, input);
     }
@@ -76,7 +80,7 @@ fn single_pass_find_collision(n: u8) -> Result<(u128, u128), &'static str> {
 /// Optimized implementation to find a Sayler 6-collision
 ///
 /// Uses stack-allocated arrays
-pub fn find_6_collision() -> Result<(u128, u128), &'static str> {
+pub fn find_6_collision() -> Result<SaylerResult, &'static str> {
     const TIMED_ITERATIONS: u32 = 1000000;
 
     // We expect a collision after roughly 2^(4*n) inputs due to the birthday paradox
@@ -102,7 +106,7 @@ pub fn find_6_collision() -> Result<(u128, u128), &'static str> {
             eprintln!("Completed running {} iterations in {} seconds",
                       input,
                       start.elapsed().as_secs_f32());
-            return Ok((*hashes.get(&entry).unwrap(), input));
+            return Ok(SaylerResult {inputs: (*hashes.get(&entry).unwrap(), input)});
         }
         hashes.insert(entry, input);
     }
