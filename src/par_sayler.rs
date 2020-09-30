@@ -8,6 +8,7 @@ use std::convert::TryInto;
 use std::cmp::min;
 use md5::Digest;
 use std::borrow::Borrow;
+use num_cpus;
 
 use super::sayler::SaylerResult;
 
@@ -110,11 +111,10 @@ fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     let optimized_impl = optimized_implementations.get(&n);
 
     let worker_to_reader_ratio: usize = if optimized_impl.is_some() {1} else {2};
-    // TODO: pull dynamically or allow user to specify
-    const CORES: usize = 16;
+    let cores: usize = num_cpus::get();
     const BUFFER_SIZE: usize = 128;
 
-    let reader_threads = CORES / (worker_to_reader_ratio + 1);
+    let reader_threads = cores / (worker_to_reader_ratio + 1);
     let worker_threads = reader_threads * worker_to_reader_ratio;
 
     let lower_sayler_bound: u128 = 0;
