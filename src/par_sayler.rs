@@ -75,59 +75,10 @@ fn extract_sayler_value(hash: Digest, n: usize) -> u128 {
     return int_val;
 }
 
-fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
-    const WORKER_TO_READER_RATIO: usize = 2;
-    // TODO: pull dynamically or allow user to specify
-    const CORES: usize = 16;
-    const BUFFER_SIZE: usize = 128;
-
-    let reader_threads = CORES / (WORKER_TO_READER_RATIO + 1);
-    let worker_threads = reader_threads * WORKER_TO_READER_RATIO;
-
-    let lower_sayler_bound: u128 = 0;
-    let mut upper_sayler_bound_bytes:Vec<u8> = Vec::new();
-    for _ in 0..n {
-        upper_sayler_bound_bytes.push(u8::max_value());
-    }
-    for _ in n..16 {
-        upper_sayler_bound_bytes.push(u8::min_value());
-    }
-    let upper_sayler_bound = u128::from_le_bytes(upper_sayler_bound_bytes.as_slice().try_into().unwrap());
-
-    let stride = (upper_sayler_bound - lower_sayler_bound) / (reader_threads as u128);
-
-    let (result_tx, result_rx) = mpsc::channel();
-
-    // Rayon's par_iter blocks so we need to spawn readers and workers in separate threads
-    let (reader_txs, reader_rxs) = (0..reader_threads).map(|_| mpsc::sync_channel(BUFFER_SIZE)).unzip();
-    thread::spawn(move || spawn_readers(reader_threads.clone(), result_tx, reader_rxs, n.clone() as usize));
-    thread::spawn(move || spawn_workers(worker_threads, reader_txs, stride, reader_threads, n as usize));
-
-    let result = result_rx.recv();
-
-    return match result {
-        Ok(result) => result,
-        // TODO: should propagate errors
-        Err(_) => Err("Error while fetching result"),
-    }
-}
-
-fn spawn_readers(
-    threads: usize,
-    result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>,
-    reader_rxs: Vec<mpsc::Receiver<WorkerResult>>,
-    n: usize
-) {
-    let reader_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
-    reader_pool.build().unwrap().install(|| {
-        (reader_rxs).into_par_iter()
-            .for_each_with(ReaderInit {result_tx, n}, reader_thread);
-    })
-}
-
-fn reader_thread(init: &mut ReaderInit, rx: mpsc::Receiver<WorkerResult>) {
-    let cloned_tx = mpsc::Sender::clone(&init.result_tx);
-    hash_tracker(rx, cloned_tx, init.n);
+#[derive(Clone)]
+struct OptimizedImplementation {
+    n: u8,
+    spawn_workers: fn(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize),
 }
 
 #[derive(Clone)]
@@ -147,6 +98,101 @@ struct WorkerInit {
     stride: u128,
     partitions: usize,
     n: usize,
+}
+
+fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
+    let optimized_implementations: HashMap<u8, OptimizedImplementation> =
+        [
+            (6, OptimizedImplementation{ n: 6, spawn_workers: spawn_workers_6 }),
+            (10, OptimizedImplementation{ n: 10, spawn_workers: spawn_workers_10 }),
+        ].iter().cloned().collect();
+
+    let optimized_impl = optimized_implementations.get(&n);
+
+    let worker_to_reader_ratio: usize = if optimized_impl.is_some() {1} else {2};
+    // TODO: pull dynamically or allow user to specify
+    const CORES: usize = 16;
+    const BUFFER_SIZE: usize = 128;
+
+    let reader_threads = CORES / (worker_to_reader_ratio + 1);
+    let worker_threads = reader_threads * worker_to_reader_ratio;
+
+    let lower_sayler_bound: u128 = 0;
+    let mut upper_sayler_bound_bytes:Vec<u8> = Vec::new();
+    for _ in 0..n {
+        upper_sayler_bound_bytes.push(u8::max_value());
+    }
+    for _ in n..16 {
+        upper_sayler_bound_bytes.push(u8::min_value());
+    }
+    let upper_sayler_bound = u128::from_le_bytes(upper_sayler_bound_bytes.as_slice().try_into().unwrap());
+
+    let stride = (upper_sayler_bound - lower_sayler_bound) / (reader_threads as u128);
+
+    let result = match optimized_impl {
+        Some(optimized) => spawn_threads_optimized(
+            reader_threads,
+            worker_threads,
+            stride,
+            BUFFER_SIZE,
+            optimized.clone(),
+            ),
+        None => spawn_threads(
+                reader_threads,
+                worker_threads,
+                stride,
+                BUFFER_SIZE,
+                n as usize,
+            ),
+    }.recv();
+
+    return match result {
+        Ok(result) => result,
+        // TODO: should propagate errors
+        Err(_) => Err("Error while fetching result"),
+    }
+}
+
+fn spawn_threads(reader_threads: usize, worker_threads: usize, stride: u128, buffer_size: usize, n: usize) -> mpsc::Receiver<Result<SaylerResult, &'static str>> {
+    let (result_tx, result_rx) = mpsc::channel();
+
+    // Rayon's par_iter blocks so we need to spawn readers and workers in separate threads
+    let (reader_txs, reader_rxs) = (0..reader_threads).map(|_| mpsc::sync_channel(buffer_size)).unzip();
+    thread::spawn(move || spawn_readers(reader_threads.clone(), result_tx, reader_rxs, n.clone()));
+    thread::spawn(move || spawn_workers(worker_threads, reader_txs, stride, reader_threads, n));
+
+    return result_rx;
+}
+
+fn spawn_threads_optimized(reader_threads: usize, worker_threads: usize, stride: u128, buffer_size: usize, optimized_impl: OptimizedImplementation) -> mpsc::Receiver<Result<SaylerResult, &'static str>> {
+    let n: usize = optimized_impl.n.clone() as usize;
+
+    let (result_tx, result_rx) = mpsc::channel();
+
+    // Rayon's par_iter blocks so we need to spawn readers and workers in separate threads
+    let (reader_txs, reader_rxs) = (0..reader_threads).map(|_| mpsc::sync_channel(buffer_size)).unzip();
+    thread::spawn(move || spawn_readers(reader_threads.clone(), result_tx, reader_rxs, n));
+    thread::spawn(move || (optimized_impl.spawn_workers)(worker_threads, reader_txs, stride, reader_threads));
+
+    return result_rx;
+}
+
+fn spawn_readers(
+    threads: usize,
+    result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>,
+    reader_rxs: Vec<mpsc::Receiver<WorkerResult>>,
+    n: usize
+) {
+    let reader_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    reader_pool.build().unwrap().install(|| {
+        (reader_rxs).into_par_iter()
+            .for_each_with(ReaderInit {result_tx, n}, reader_thread);
+    })
+}
+
+fn reader_thread(init: &mut ReaderInit, rx: mpsc::Receiver<WorkerResult>) {
+    let cloned_tx = mpsc::Sender::clone(&init.result_tx);
+    hash_tracker(rx, cloned_tx, init.n);
 }
 
 fn spawn_workers(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize, n: usize) {
@@ -216,6 +262,59 @@ fn check_hash(item: WorkerResult, hashes: &mut HashMap<u128, u128>) -> Option<Sa
 
     hashes.insert(item.result, item.input);
     return None;
+}
+
+
+fn extract_sayler_value_6(hash: Digest) -> u128 {
+    return u128::from_le_bytes([hash[0], hash[1], hash[2], hash[13], hash[14], hash[15], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+fn spawn_workers_6(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize) {
+    eprintln!("Spawning workers optimized for finding Sayler 6-collisions");
+
+    let worker_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    worker_pool.build().unwrap().install(|| {
+        (0..std::u128::MAX).into_par_iter()
+            .for_each_with(WorkerInit {reader_txs, stride, partitions, n: 6}, hash_worker_6);
+    });
+}
+
+fn hash_worker_6(init: &mut WorkerInit, input: u128) {
+    let digest = md5::compute(input.to_be_bytes());
+    let sayler_value = extract_sayler_value_6(digest);
+
+    let reader = partition(sayler_value, init.stride, init.partitions);
+    let tx = init.reader_txs[reader].borrow();
+    match tx.send(WorkerResult { input, result: sayler_value }) {
+        Err(e) => eprintln!("Worker error while sending result to reader {}: {}", reader, e),
+        Ok(_) => (),
+    }
+}
+
+fn extract_sayler_value_10(hash: Digest) -> u128 {
+    return u128::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[11], hash[12], hash[13], hash[14], hash[15], 0, 0, 0, 0, 0, 0]);
+}
+
+fn spawn_workers_10(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize) {
+    eprintln!("Spawning workers optimized for finding Sayler 10-collisions");
+
+    let worker_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
+    worker_pool.build().unwrap().install(|| {
+        (0..std::u128::MAX).into_par_iter()
+            .for_each_with(WorkerInit {reader_txs, stride, partitions, n: 10}, hash_worker_10);
+    });
+}
+
+fn hash_worker_10(init: &mut WorkerInit, input: u128) {
+    let digest = md5::compute(input.to_be_bytes());
+    let sayler_value = extract_sayler_value_10(digest);
+
+    let reader = partition(sayler_value, init.stride, init.partitions);
+    let tx = init.reader_txs[reader].borrow();
+    match tx.send(WorkerResult { input, result: sayler_value }) {
+        Err(e) => eprintln!("Worker error while sending result to reader {}: {}", reader, e),
+        Ok(_) => (),
+    }
 }
 
 
