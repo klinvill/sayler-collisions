@@ -26,7 +26,10 @@ pub fn find_collision(n: u8) -> Result<SaylerResult, &'static str> {
         return Err("Only even n values are currently supported")
     }
 
-    return single_pass_find_collision(n);
+    return match n {
+        6 => find_6_collision(),
+        _ => single_pass_find_collision(n),
+    }
 }
 
 /// Uses a hashmap to keep track of the inputs that caused each output hash
@@ -81,6 +84,8 @@ fn single_pass_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
 ///
 /// Uses stack-allocated arrays
 pub fn find_6_collision() -> Result<SaylerResult, &'static str> {
+    eprintln!("Running optimized function for finding Sayler 6-collisions");
+
     const TIMED_ITERATIONS: u32 = 1000000;
 
     // We expect a collision after roughly 2^(4*n) inputs due to the birthday paradox
