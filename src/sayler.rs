@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use md5;
+use std::collections::HashMap;
 use std::time;
 
 pub struct SaylerResult {
@@ -23,13 +23,13 @@ pub fn find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     // TODO: handle non-even n which would require tracking arrays of 4 bits rather than the arrays
     //  of bytes that the MD5 digest produces
     if n % 2 != 0 {
-        return Err("Only even n values are currently supported")
+        return Err("Only even n values are currently supported");
     }
 
     return match n {
         6 => find_6_collision(),
         _ => single_pass_find_collision(n),
-    }
+    };
 }
 
 /// Uses a hashmap to keep track of the inputs that caused each output hash
@@ -53,7 +53,10 @@ fn single_pass_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     for input in 0..std::u128::MAX {
         if input % (TIMED_ITERATIONS as u128) == 0 {
             let iter_rate = (TIMED_ITERATIONS as f32) / loop_start.elapsed().as_secs_f32();
-            eprintln!("Reached {} iterations, running {} iterations / s", input, iter_rate);
+            eprintln!(
+                "Reached {} iterations, running {} iterations / s",
+                input, iter_rate
+            );
             loop_start = time::Instant::now();
         }
 
@@ -68,17 +71,20 @@ fn single_pass_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
         entry.extend_from_slice(&digest[tail_index..]);
 
         if hashes.contains_key(entry.as_slice()) {
-            eprintln!("Completed running {} iterations in {} seconds",
-                      input,
-                      start.elapsed().as_secs_f32());
-            return Ok(SaylerResult {inputs: (*hashes.get(entry.as_slice()).unwrap(), input)});
+            eprintln!(
+                "Completed running {} iterations in {} seconds",
+                input,
+                start.elapsed().as_secs_f32()
+            );
+            return Ok(SaylerResult {
+                inputs: (*hashes.get(entry.as_slice()).unwrap(), input),
+            });
         }
         hashes.insert(entry, input);
     }
 
-    return Err("No collisions found")
+    return Err("No collisions found");
 }
-
 
 /// Optimized implementation to find a Sayler 6-collision
 ///
@@ -99,22 +105,31 @@ pub fn find_6_collision() -> Result<SaylerResult, &'static str> {
     for input in 0..std::u128::MAX {
         if input % (TIMED_ITERATIONS as u128) == 0 {
             let iter_rate = (TIMED_ITERATIONS as f32) / loop_start.elapsed().as_secs_f32();
-            eprintln!("Reached {} iterations, running {} iterations / s", input, iter_rate);
+            eprintln!(
+                "Reached {} iterations, running {} iterations / s",
+                input, iter_rate
+            );
             loop_start = time::Instant::now();
         }
 
         let digest = md5::compute(input.to_be_bytes());
 
-        let entry = [digest[0], digest[1], digest[2], digest[13], digest[14], digest[15]];
+        let entry = [
+            digest[0], digest[1], digest[2], digest[13], digest[14], digest[15],
+        ];
 
         if hashes.contains_key(&entry) {
-            eprintln!("Completed running {} iterations in {} seconds",
-                      input,
-                      start.elapsed().as_secs_f32());
-            return Ok(SaylerResult {inputs: (*hashes.get(&entry).unwrap(), input)});
+            eprintln!(
+                "Completed running {} iterations in {} seconds",
+                input,
+                start.elapsed().as_secs_f32()
+            );
+            return Ok(SaylerResult {
+                inputs: (*hashes.get(&entry).unwrap(), input),
+            });
         }
         hashes.insert(entry, input);
     }
 
-    return Err("No collisions found")
+    return Err("No collisions found");
 }

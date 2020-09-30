@@ -1,8 +1,8 @@
-mod sayler;
 mod par_sayler;
+mod sayler;
 
-use structopt::StructOpt;
 use md5;
+use structopt::StructOpt;
 
 /// Finds a MD5 Sayler n-collision
 ///
@@ -37,9 +37,11 @@ fn main() {
 
     let hashes = (
         format!("{:x}", md5::compute(collision.0.to_be_bytes())),
-        format!("{:x}", md5::compute(collision.1.to_be_bytes()))
+        format!("{:x}", md5::compute(collision.1.to_be_bytes())),
     );
 
-    println!("Collision found! {} and {} produce the hashes {} and {} respectively",
-        collision.0, collision.1, hashes.0, hashes.1);
+    println!(
+        "Collision found! {} and {} produce the hashes {} and {} respectively",
+        collision.0, collision.1, hashes.0, hashes.1
+    );
 }

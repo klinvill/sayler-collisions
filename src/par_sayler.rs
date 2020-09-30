@@ -1,14 +1,14 @@
-use std::collections::HashMap;
 use md5;
+use md5::Digest;
+use num_cpus;
 use rayon::prelude::*;
+use std::borrow::Borrow;
+use std::cmp::min;
+use std::collections::HashMap;
+use std::convert::TryInto;
 use std::sync::mpsc;
 use std::thread;
 use std::time;
-use std::convert::TryInto;
-use std::cmp::min;
-use md5::Digest;
-use std::borrow::Borrow;
-use num_cpus;
 
 use super::sayler::SaylerResult;
 
@@ -32,7 +32,7 @@ pub fn find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     // TODO: handle non-even n which would require tracking arrays of 4 bits rather than the arrays
     //  of bytes that the MD5 digest produces
     if n % 2 != 0 {
-        return Err("Only even n values are currently supported")
+        return Err("Only even n values are currently supported");
     }
 
     return parallel_find_collision(n);
@@ -44,7 +44,7 @@ pub fn find_collision(n: u8) -> Result<SaylerResult, &'static str> {
 /// [`stride`]: stride between partitions
 /// [`partitions`]: number of partitions
 fn partition(value: u128, stride: u128, partitions: usize) -> usize {
-    return min((value / stride) as usize, partitions-1);
+    return min((value / stride) as usize, partitions - 1);
 }
 
 /// Computes the Sayler value from an md5 hash
@@ -79,7 +79,12 @@ fn extract_sayler_value(hash: Digest, n: usize) -> u128 {
 #[derive(Clone)]
 struct OptimizedImplementation {
     n: u8,
-    spawn_workers: fn(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize),
+    spawn_workers: fn(
+        threads: usize,
+        reader_txs: Vec<mpsc::SyncSender<WorkerResult>>,
+        stride: u128,
+        partitions: usize,
+    ),
 }
 
 #[derive(Clone)]
@@ -102,15 +107,29 @@ struct WorkerInit {
 }
 
 fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
-    let optimized_implementations: HashMap<u8, OptimizedImplementation> =
-        [
-            (6, OptimizedImplementation{ n: 6, spawn_workers: spawn_workers_6 }),
-            (10, OptimizedImplementation{ n: 10, spawn_workers: spawn_workers_10 }),
-        ].iter().cloned().collect();
+    let optimized_implementations: HashMap<u8, OptimizedImplementation> = [
+        (
+            6,
+            OptimizedImplementation {
+                n: 6,
+                spawn_workers: spawn_workers_6,
+            },
+        ),
+        (
+            10,
+            OptimizedImplementation {
+                n: 10,
+                spawn_workers: spawn_workers_10,
+            },
+        ),
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
     let optimized_impl = optimized_implementations.get(&n);
 
-    let worker_to_reader_ratio: usize = if optimized_impl.is_some() {1} else {2};
+    let worker_to_reader_ratio: usize = if optimized_impl.is_some() { 1 } else { 2 };
     let cores: usize = num_cpus::get();
     const BUFFER_SIZE: usize = 128;
 
@@ -118,14 +137,15 @@ fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
     let worker_threads = reader_threads * worker_to_reader_ratio;
 
     let lower_sayler_bound: u128 = 0;
-    let mut upper_sayler_bound_bytes:Vec<u8> = Vec::new();
+    let mut upper_sayler_bound_bytes: Vec<u8> = Vec::new();
     for _ in 0..n {
         upper_sayler_bound_bytes.push(u8::max_value());
     }
     for _ in n..16 {
         upper_sayler_bound_bytes.push(u8::min_value());
     }
-    let upper_sayler_bound = u128::from_le_bytes(upper_sayler_bound_bytes.as_slice().try_into().unwrap());
+    let upper_sayler_bound =
+        u128::from_le_bytes(upper_sayler_bound_bytes.as_slice().try_into().unwrap());
 
     let stride = (upper_sayler_bound - lower_sayler_bound) / (reader_threads as u128);
 
@@ -136,43 +156,62 @@ fn parallel_find_collision(n: u8) -> Result<SaylerResult, &'static str> {
             stride,
             BUFFER_SIZE,
             optimized.clone(),
-            ),
+        ),
         None => spawn_threads(
-                reader_threads,
-                worker_threads,
-                stride,
-                BUFFER_SIZE,
-                n as usize,
-            ),
-    }.recv();
+            reader_threads,
+            worker_threads,
+            stride,
+            BUFFER_SIZE,
+            n as usize,
+        ),
+    }
+    .recv();
 
     return match result {
         Ok(result) => result,
         // TODO: should propagate errors
         Err(_) => Err("Error while fetching result"),
-    }
+    };
 }
 
-fn spawn_threads(reader_threads: usize, worker_threads: usize, stride: u128, buffer_size: usize, n: usize) -> mpsc::Receiver<Result<SaylerResult, &'static str>> {
+fn spawn_threads(
+    reader_threads: usize,
+    worker_threads: usize,
+    stride: u128,
+    buffer_size: usize,
+    n: usize,
+) -> mpsc::Receiver<Result<SaylerResult, &'static str>> {
     let (result_tx, result_rx) = mpsc::channel();
 
     // Rayon's par_iter blocks so we need to spawn readers and workers in separate threads
-    let (reader_txs, reader_rxs) = (0..reader_threads).map(|_| mpsc::sync_channel(buffer_size)).unzip();
+    let (reader_txs, reader_rxs) = (0..reader_threads)
+        .map(|_| mpsc::sync_channel(buffer_size))
+        .unzip();
     thread::spawn(move || spawn_readers(reader_threads.clone(), result_tx, reader_rxs, n.clone()));
     thread::spawn(move || spawn_workers(worker_threads, reader_txs, stride, reader_threads, n));
 
     return result_rx;
 }
 
-fn spawn_threads_optimized(reader_threads: usize, worker_threads: usize, stride: u128, buffer_size: usize, optimized_impl: OptimizedImplementation) -> mpsc::Receiver<Result<SaylerResult, &'static str>> {
+fn spawn_threads_optimized(
+    reader_threads: usize,
+    worker_threads: usize,
+    stride: u128,
+    buffer_size: usize,
+    optimized_impl: OptimizedImplementation,
+) -> mpsc::Receiver<Result<SaylerResult, &'static str>> {
     let n: usize = optimized_impl.n.clone() as usize;
 
     let (result_tx, result_rx) = mpsc::channel();
 
     // Rayon's par_iter blocks so we need to spawn readers and workers in separate threads
-    let (reader_txs, reader_rxs) = (0..reader_threads).map(|_| mpsc::sync_channel(buffer_size)).unzip();
+    let (reader_txs, reader_rxs) = (0..reader_threads)
+        .map(|_| mpsc::sync_channel(buffer_size))
+        .unzip();
     thread::spawn(move || spawn_readers(reader_threads.clone(), result_tx, reader_rxs, n));
-    thread::spawn(move || (optimized_impl.spawn_workers)(worker_threads, reader_txs, stride, reader_threads));
+    thread::spawn(move || {
+        (optimized_impl.spawn_workers)(worker_threads, reader_txs, stride, reader_threads)
+    });
 
     return result_rx;
 }
@@ -181,12 +220,13 @@ fn spawn_readers(
     threads: usize,
     result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>,
     reader_rxs: Vec<mpsc::Receiver<WorkerResult>>,
-    n: usize
+    n: usize,
 ) {
     let reader_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
     reader_pool.build().unwrap().install(|| {
-        (reader_rxs).into_par_iter()
-            .for_each_with(ReaderInit {result_tx, n}, reader_thread);
+        (reader_rxs)
+            .into_par_iter()
+            .for_each_with(ReaderInit { result_tx, n }, reader_thread);
     })
 }
 
@@ -195,11 +235,24 @@ fn reader_thread(init: &mut ReaderInit, rx: mpsc::Receiver<WorkerResult>) {
     hash_tracker(rx, cloned_tx, init.n);
 }
 
-fn spawn_workers(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize, n: usize) {
+fn spawn_workers(
+    threads: usize,
+    reader_txs: Vec<mpsc::SyncSender<WorkerResult>>,
+    stride: u128,
+    partitions: usize,
+    n: usize,
+) {
     let worker_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
     worker_pool.build().unwrap().install(|| {
-        (0..std::u128::MAX).into_par_iter()
-            .for_each_with(WorkerInit {reader_txs, stride, partitions, n}, hash_worker);
+        (0..std::u128::MAX).into_par_iter().for_each_with(
+            WorkerInit {
+                reader_txs,
+                stride,
+                partitions,
+                n,
+            },
+            hash_worker,
+        );
     });
 }
 
@@ -209,13 +262,23 @@ fn hash_worker(init: &mut WorkerInit, input: u128) {
 
     let reader = partition(sayler_value, init.stride, init.partitions);
     let tx = init.reader_txs[reader].borrow();
-    match tx.send(WorkerResult { input, result: sayler_value }) {
-        Err(e) => eprintln!("Worker error while sending result to reader {}: {}", reader, e),
+    match tx.send(WorkerResult {
+        input,
+        result: sayler_value,
+    }) {
+        Err(e) => eprintln!(
+            "Worker error while sending result to reader {}: {}",
+            reader, e
+        ),
         Ok(_) => (),
     }
 }
 
-fn hash_tracker(worker_rx: mpsc::Receiver<WorkerResult>, result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>, n: usize) {
+fn hash_tracker(
+    worker_rx: mpsc::Receiver<WorkerResult>,
+    result_tx: mpsc::Sender<Result<SaylerResult, &'static str>>,
+    n: usize,
+) {
     const TIMED_ITERATIONS: u32 = 1000000;
 
     // We expect a collision after roughly 2^(4*n) inputs due to the birthday paradox
@@ -239,43 +302,66 @@ fn hash_tracker(worker_rx: mpsc::Receiver<WorkerResult>, result_tx: mpsc::Sender
 
         if hashes.len() % (TIMED_ITERATIONS as usize) == 0 {
             let iter_rate = (TIMED_ITERATIONS as f32) / loop_start.elapsed().as_secs_f32();
-            eprintln!("Reached {} iterations, running {} iterations / s", hashes.len(), iter_rate);
+            eprintln!(
+                "Reached {} iterations, running {} iterations / s",
+                hashes.len(),
+                iter_rate
+            );
             loop_start = time::Instant::now();
         }
-    };
+    }
 
-    eprintln!("Completed running {} hashes in {} seconds", hashes.len(), start.elapsed().as_secs_f32());
+    eprintln!(
+        "Completed running {} hashes in {} seconds",
+        hashes.len(),
+        start.elapsed().as_secs_f32()
+    );
 
-    result_tx.send(
-        match collision {
+    result_tx
+        .send(match collision {
             None => Err("No collisions found"),
             Some(result) => Ok(result),
-        }
-    ).unwrap();
+        })
+        .unwrap();
 }
 
 fn check_hash(item: WorkerResult, hashes: &mut HashMap<u128, u128>) -> Option<SaylerResult> {
     if hashes.contains_key(&item.result) {
         let previous_input = *hashes.get(&item.result).unwrap();
-        return Some(SaylerResult {inputs: (previous_input, item.input)});
+        return Some(SaylerResult {
+            inputs: (previous_input, item.input),
+        });
     }
 
     hashes.insert(item.result, item.input);
     return None;
 }
 
-
 fn extract_sayler_value_6(hash: Digest) -> u128 {
-    return u128::from_le_bytes([hash[0], hash[1], hash[2], hash[13], hash[14], hash[15], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    return u128::from_le_bytes([
+        hash[0], hash[1], hash[2], hash[13], hash[14], hash[15], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
 }
 
-fn spawn_workers_6(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize) {
+fn spawn_workers_6(
+    threads: usize,
+    reader_txs: Vec<mpsc::SyncSender<WorkerResult>>,
+    stride: u128,
+    partitions: usize,
+) {
     eprintln!("Spawning workers optimized for finding Sayler 6-collisions");
 
     let worker_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
     worker_pool.build().unwrap().install(|| {
-        (0..std::u128::MAX).into_par_iter()
-            .for_each_with(WorkerInit {reader_txs, stride, partitions, n: 6}, hash_worker_6);
+        (0..std::u128::MAX).into_par_iter().for_each_with(
+            WorkerInit {
+                reader_txs,
+                stride,
+                partitions,
+                n: 6,
+            },
+            hash_worker_6,
+        );
     });
 }
 
@@ -285,23 +371,44 @@ fn hash_worker_6(init: &mut WorkerInit, input: u128) {
 
     let reader = partition(sayler_value, init.stride, init.partitions);
     let tx = init.reader_txs[reader].borrow();
-    match tx.send(WorkerResult { input, result: sayler_value }) {
-        Err(e) => eprintln!("Worker error while sending result to reader {}: {}", reader, e),
+    match tx.send(WorkerResult {
+        input,
+        result: sayler_value,
+    }) {
+        Err(e) => eprintln!(
+            "Worker error while sending result to reader {}: {}",
+            reader, e
+        ),
         Ok(_) => (),
     }
 }
 
 fn extract_sayler_value_10(hash: Digest) -> u128 {
-    return u128::from_le_bytes([hash[0], hash[1], hash[2], hash[3], hash[4], hash[11], hash[12], hash[13], hash[14], hash[15], 0, 0, 0, 0, 0, 0]);
+    return u128::from_le_bytes([
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[11], hash[12], hash[13], hash[14],
+        hash[15], 0, 0, 0, 0, 0, 0,
+    ]);
 }
 
-fn spawn_workers_10(threads: usize, reader_txs: Vec<mpsc::SyncSender<WorkerResult>>, stride: u128, partitions: usize) {
+fn spawn_workers_10(
+    threads: usize,
+    reader_txs: Vec<mpsc::SyncSender<WorkerResult>>,
+    stride: u128,
+    partitions: usize,
+) {
     eprintln!("Spawning workers optimized for finding Sayler 10-collisions");
 
     let worker_pool = rayon::ThreadPoolBuilder::new().num_threads(threads);
     worker_pool.build().unwrap().install(|| {
-        (0..std::u128::MAX).into_par_iter()
-            .for_each_with(WorkerInit {reader_txs, stride, partitions, n: 10}, hash_worker_10);
+        (0..std::u128::MAX).into_par_iter().for_each_with(
+            WorkerInit {
+                reader_txs,
+                stride,
+                partitions,
+                n: 10,
+            },
+            hash_worker_10,
+        );
     });
 }
 
@@ -311,12 +418,17 @@ fn hash_worker_10(init: &mut WorkerInit, input: u128) {
 
     let reader = partition(sayler_value, init.stride, init.partitions);
     let tx = init.reader_txs[reader].borrow();
-    match tx.send(WorkerResult { input, result: sayler_value }) {
-        Err(e) => eprintln!("Worker error while sending result to reader {}: {}", reader, e),
+    match tx.send(WorkerResult {
+        input,
+        result: sayler_value,
+    }) {
+        Err(e) => eprintln!(
+            "Worker error while sending result to reader {}: {}",
+            reader, e
+        ),
         Ok(_) => (),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -332,11 +444,16 @@ mod tests {
             let stride = 2;
             let partitions = 3;
 
-            values.zip(expected_partitions).for_each(|(value, expected_partition)| {
-                let actual = partition(value, stride, partitions);
-                assert_eq!(actual, expected_partition,
-                           "Mismatch between actual and expected partitions for input value {}", value);
-            });
+            values
+                .zip(expected_partitions)
+                .for_each(|(value, expected_partition)| {
+                    let actual = partition(value, stride, partitions);
+                    assert_eq!(
+                        actual, expected_partition,
+                        "Mismatch between actual and expected partitions for input value {}",
+                        value
+                    );
+                });
         }
 
         #[test]
@@ -348,7 +465,6 @@ mod tests {
             let stride = 2;
             let partitions = 3;
 
-
             let actual = partition(value, stride, partitions);
             assert_eq!(actual, expected_partition);
         }
@@ -359,7 +475,7 @@ mod tests {
 
         #[test]
         fn test_extract_sayler_value() {
-            let a = md5::Digest([0, 1, 2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15]);
+            let a = md5::Digest([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
             let b = md5::Digest([0, 1, 2, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 13, 14, 15]);
             let c = md5::Digest([99; 16]);
             let d = md5::Digest([1, 0, 2, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 13, 14, 15]);
